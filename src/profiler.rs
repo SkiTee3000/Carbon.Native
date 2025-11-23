@@ -155,7 +155,8 @@ pub struct ManagedCallbacks
 
 	pub basic_iter: BasicIterCallback,
 	pub adv_iter: AdvancedIterCallback,
-	pub mem_iter: MemoryIterCallback
+	pub mem_iter: MemoryIterCallback,
+	pub heap_snapshot_iter: HeapSnapshotIterCallback
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1224,4 +1225,192 @@ pub unsafe extern "C" fn method_exception_leave<const TIMED: bool>(profiler: &Mo
 		println!("exception in {}", (*method).get_name());
 	}
 	exit_method::<TIMED>(profiler, method, true);
+}
+
+// ============================================================================
+// HEAP SNAPSHOT
+// ============================================================================
+
+/// Record for a single class in heap snapshot
+#[repr(C)]
+pub struct HeapSnapshotRecord
+{
+	pub assembly_handle: *const MonoImage,
+	pub class_handle: *const MonoClass,
+	pub object_count: u64,
+	pub total_size: u64,
+	pub instance_size: u32,
+	pub class_token: u32,
+}
+
+impl Default for HeapSnapshotRecord
+{
+	fn default() -> Self {
+		Self {
+			assembly_handle: ptr::null(),
+			class_handle: ptr::null(),
+			object_count: 0,
+			total_size: 0,
+			instance_size: 0,
+			class_token: 0,
+		}
+	}
+}
+
+/// Summary stats for heap snapshot
+#[repr(C)]
+pub struct HeapSnapshotSummary
+{
+	pub total_objects: u64,
+	pub total_size: u64,
+	pub unique_classes: u64,
+}
+
+pub type HeapSnapshotIterCallback = extern "system" fn(
+	*mut (),
+	u64,
+	&mut HeapSnapshotIter,
+	unsafe extern "system" fn(&mut HeapSnapshotIter, &mut HeapSnapshotRecord) -> bool
+);
+
+pub type HeapSnapshotIter<'a> = Iter<'a, *const MonoClass, HeapClassData>;
+
+#[derive(Default, Clone)]
+pub struct HeapClassData
+{
+	pub count: u64,
+	pub total_size: u64,
+	pub instance_size: u32,
+}
+
+struct HeapWalkContext
+{
+	pub data: HashMap<*const MonoClass, HeapClassData>,
+	pub total_objects: u64,
+	pub total_size: u64,
+}
+
+/// Takes a heap snapshot - collects all live objects in managed heap
+///
+/// # Arguments
+/// * `run_gc` - If true, runs GC before snapshot to get only truly live objects
+/// * `summary_out` - Output for summary statistics
+/// * `snapshot_out` - Output pointer for managed callback
+///
+/// # Returns
+/// ProfilerResultCode indicating success or failure
+#[no_mangle]
+pub unsafe extern "system" fn take_heap_snapshot(
+	run_gc: bool,
+	summary_out: *mut HeapSnapshotSummary,
+	snapshot_out: *mut (),
+) -> ProfilerResultCode
+{
+	return run_ffi_safe!("take_heap_snapshot", ProfilerResultCode::UnknownError, {
+		let td = get_thread_data();
+		if !td.main {
+			return ProfilerResultCode::MainThreadOnly;
+		}
+
+		let profiler = some_or_ret!(&PROFILER, ProfilerResultCode::NotInitialized);
+		let callbacks = *some_or_ret!(&profiler.callbacks, ProfilerResultCode::NotInitialized);
+
+		// Optionally run GC to collect garbage first
+		if run_gc {
+			let max_gen = mono_gc_max_generation();
+			mono_gc_collect(max_gen);
+		}
+
+		// Context for heap walk
+		let mut ctx = HeapWalkContext {
+			data: HashMap::with_capacity(256),
+			total_objects: 0,
+			total_size: 0,
+		};
+
+		// Walk the heap
+		let result = mono_gc_walk_heap(
+			0, // flags
+			heap_walk_callback,
+			&mut ctx as *mut HeapWalkContext as *mut ()
+		);
+
+		if result != 0 {
+			#[cfg(debug_assertions)]
+			{
+				println!("mono_gc_walk_heap failed with code: {}", result);
+			}
+			return ProfilerResultCode::UnknownError;
+		}
+
+		// Fill summary
+		if !summary_out.is_null() {
+			*summary_out = HeapSnapshotSummary {
+				total_objects: ctx.total_objects,
+				total_size: ctx.total_size,
+				unique_classes: ctx.data.len() as u64,
+			};
+		}
+
+		// Return data via callback
+		if !snapshot_out.is_null() && !ctx.data.is_empty() {
+			(callbacks.heap_snapshot_iter)(
+				snapshot_out,
+				ctx.data.len() as u64,
+				&mut ctx.data.iter(),
+				iter_heap_snapshot_fn
+			);
+		}
+
+		ProfilerResultCode::OK
+	});
+
+	unsafe extern "C" fn heap_walk_callback(
+		obj: *const MonoObject,
+		klass: *const MonoClass,
+		size: usize,
+		user_data: *mut ()
+	) -> i32
+	{
+		if obj.is_null() || klass.is_null() {
+			return 0; // continue walking
+		}
+
+		let ctx = &mut *(user_data as *mut HeapWalkContext);
+		let klass_ref = &*klass;
+
+		ctx.total_objects += 1;
+		ctx.total_size += size as u64;
+
+		let entry = ctx.data.entry(klass).or_insert_with(|| HeapClassData {
+			instance_size: klass_ref.instance_size as u32,
+			..Default::default()
+		});
+
+		entry.count += 1;
+		entry.total_size += size as u64;
+
+		0 // return 0 to continue, non-zero to stop
+	}
+
+	unsafe extern "system" fn iter_heap_snapshot_fn(
+		iter: &mut HeapSnapshotIter,
+		out: &mut HeapSnapshotRecord
+	) -> bool
+	{
+		if let Some((class_ptr, data)) = iter.next()
+		{
+			let class = &**class_ptr;
+			*out = HeapSnapshotRecord {
+				assembly_handle: class.image,
+				class_handle: *class_ptr,
+				class_token: class.type_token,
+				object_count: data.count,
+				total_size: data.total_size,
+				instance_size: data.instance_size,
+			};
+			return true;
+		}
+		false
+	}
 }

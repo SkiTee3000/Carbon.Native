@@ -60,7 +60,22 @@ extern "C" {
 	pub fn mono_profiler_set_method_free_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoMethod)>);
 	pub fn mono_profiler_set_call_instrumentation_filter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoMethod) -> CallInstrumentationFlags>);
 	pub fn mono_profiler_create(info: *mut MonoProfiler) -> MonoProfilerHandle;
+
+	// GC API for heap snapshots
+	pub fn mono_gc_collect(generation: i32);
+	pub fn mono_gc_max_generation() -> i32;
+	pub fn mono_gc_walk_heap(flags: i32, callback: HeapWalkCallback, user_data: *mut ()) -> i32;
+	pub fn mono_class_get_name(klass: *const MonoClass) -> *const c_char;
+	pub fn mono_class_get_namespace(klass: *const MonoClass) -> *const c_char;
+	pub fn mono_class_get_image(klass: *const MonoClass) -> *const MonoImage;
 }
+
+pub type HeapWalkCallback = unsafe extern "C" fn(
+	obj: *const MonoObject,
+	klass: *const MonoClass,
+	size: usize,
+	user_data: *mut ()
+) -> i32;
 
 pub type EnterCB = unsafe extern "C" fn(&MonoProfiler, &MonoMethod, *const MonoProfilerCallContext);
 pub type ExitCB = unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoProfilerCallContext);
